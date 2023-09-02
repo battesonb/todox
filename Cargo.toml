@@ -7,8 +7,10 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-axum = "0.6.20"
-maud = "0.25.0"
-tokio = { version = "1.32.0", features = ["full"] }
-tower = "0.4.13"
-tower-http = { version = "0.4.3", features = ["fs"] }
+axum = "0.6"
+maud = { version = "0.25", feature = ["axum"] }
+serde = { version = "1.0.188", features = ["serde_derive"] }
+sqlx = { version = "0.7.1", features = ["sqlite"] }
+tokio = { version = "1.32", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.4", features = ["fs"] }
