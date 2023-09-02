@@ -1,6 +1,4 @@
-# todox
-
-![Screenshot](./images/screenshot.png)
+# <img align="right" src="./images/screenshot.png" width="375px" /> todox
 
 A todo application made using a bunch of frameworks containing the letter 'x'.
 This is just a toy project; use at your own risk (to productivity).
