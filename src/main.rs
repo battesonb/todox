@@ -1,6 +1,6 @@
 pub mod body;
 
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -12,6 +12,7 @@ use axum::{
 use body::{body, toggle_completed_button};
 use maud::{html, Markup};
 use serde::Deserialize;
+use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 
@@ -19,50 +20,53 @@ const HX_TRIGGER: &'static str = "HX-Trigger";
 
 #[derive(Clone)]
 struct Todo {
-    id: usize,
-    name: String,
-    completed: bool,
+    id: i64,
+    text: String,
+    done: bool,
 }
 
 impl Todo {
-    pub fn new(id: usize, name: String) -> Self {
-        Self {
-            id,
-            name,
-            completed: false,
-        }
-    }
-
     pub fn partial(&self) -> Markup {
         let id = format!("todo-{}", self.id);
         html! {
             div class="flex my-4" id=(id) {
                 form class="flex flex-1" hx-patch={"/todo/" (self.id)} hx-target={"#" (id)} hx-swap="morph:outerHTML" {
-                    button type="submit" class={"flex-1 mr-4 p-4 rounded-xl max-w-sm mx-auto cursor-pointer " @if self.completed { "line-through bg-slate-400" } @else { "bg-white" } }
+                    button type="submit" class={"flex-1 mr-4 p-4 rounded-xl max-w-sm mx-auto cursor-pointer " @if self.done { "line-through bg-slate-400" } @else { "bg-white" } }
                     {
-                        (self.name)
+                        (self.text)
                     }
                     input type="hidden" name="id" value=(self.id) {}
-                    input type="hidden" name="completed" value=(self.completed) {}
+                    input type="hidden" name="done" value=(self.done) {}
                 }
-                button class="text-white border text-2xl rounded-xl w-14 mx-auto" hx-trigger="click" hx-delete={"/todo/" (self.id)} hx-swap="none" { "x" }
+                button class="text-white border text-2xl rounded-xl w-14 mx-auto" hx-trigger="click" hx-delete={"/todo/" (self.id)} hx-target={"#" (id)} hx-swap="outerHTML" { "x" }
             }
         }
     }
 }
 
-#[derive(Default)]
 struct InnerState {
-    next_id: usize,
     hide_completed: bool,
-    todos: VecDeque<Todo>,
+    pool: SqlitePool,
 }
 
 type AppState = Arc<RwLock<InnerState>>;
 
+impl InnerState {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let options = SqliteConnectOptions::new()
+            .filename("db.sqlite")
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await?;
+        Ok(Self {
+            hide_completed: false,
+            pool,
+        })
+    }
+}
+
 #[tokio::main]
-async fn main() {
-    let state = AppState::default();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(RwLock::new(InnerState::new().await?));
     let app = Router::new()
         .route("/body", get(get_body))
         .route("/todos", get(get_todos))
@@ -78,6 +82,8 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+    Ok(())
 }
 
 async fn get_body(State(state): State<AppState>) -> Response {
@@ -85,50 +91,69 @@ async fn get_body(State(state): State<AppState>) -> Response {
     body(state.hide_completed).into_string().into_response()
 }
 
-async fn delete_todo(State(state): State<AppState>, Path(todo_id): Path<usize>) -> Response {
-    let mut state = state.write().await;
-    let todos = &mut state.todos;
-    let Some(index) = todos.iter().position(|t| t.id == todo_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+async fn delete_todo(State(state): State<AppState>, Path(todo_id): Path<i64>) -> Response {
+    let state = state.read().await;
+
+    let Ok(output) = sqlx::query("DELETE FROM todos WHERE id = $1")
+        .bind(todo_id)
+        .execute(&state.pool)
+        .await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
-    todos.remove(index);
-
-    let mut headers = HeaderMap::new();
-    headers.insert(HX_TRIGGER, "modifiedPosts".parse().unwrap());
-    headers.into_response()
-}
-
-async fn delete_completed(State(state): State<AppState>) -> Response {
-    let mut state = state.write().await;
-    let todos = &mut state.todos;
-    let len = todos.len();
-    todos.retain(|t| !t.completed);
-
-    if len != todos.len() {
+    if output.rows_affected() == 0 {
         return StatusCode::NOT_FOUND.into_response();
     }
 
     ().into_response()
 }
 
+async fn delete_completed(State(state): State<AppState>) -> Response {
+    let state = state.read().await;
+
+    let Ok(output) = sqlx::query("DELETE FROM todos WHERE done = true")
+        .execute(&state.pool)
+        .await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+
+    if output.rows_affected() == 0 {
+        return ().into_response();
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(HX_TRIGGER, "modifiedPosts".parse().unwrap());
+    headers.into_response()
+}
+
 #[derive(Deserialize)]
 struct PartialTodo {
-    id: usize,
-    completed: bool,
+    id: i64,
+    done: bool,
 }
 
 async fn patch_todo(State(state): State<AppState>, Form(form): Form<PartialTodo>) -> Response {
-    let mut state = state.write().await;
-    let todos = &mut state.todos;
-    let Some(todo) = todos.iter_mut().find(|t| t.id == form.id) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let state = state.read().await;
+
+    let done = !form.done;
+    let Ok(output) = sqlx::query!("UPDATE todos SET done = $1 WHERE id = $2", done, form.id)
+        .execute(&state.pool)
+        .await else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
-    todo.completed = !form.completed;
+    if output.rows_affected() == 0 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let Ok(todo) = sqlx::query_as!(Todo, "SELECT id, text, done FROM todos WHERE id = $1", form.id)
+        .fetch_one(&state.pool)
+        .await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
 
     let mut response = todo.partial().into_string().into_response();
-    if todo.completed {
+    if todo.done {
         let headers = response.headers_mut();
         headers.insert(HX_TRIGGER, "modifiedPosts".parse().unwrap());
     }
@@ -141,35 +166,42 @@ struct PostForm {
 }
 
 async fn post_todo(State(state): State<AppState>, Form(post_form): Form<PostForm>) -> Response {
-    let mut state = state.write().await;
-
     if post_form.text.len() == 0 {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let todo = Todo::new(state.next_id, post_form.text);
-    state.next_id += 1;
-    state.todos.push_front(todo);
+    let state = state.read().await;
+    let Ok(_) = sqlx::query("INSERT INTO todos(text) VALUES ($1)")
+        .bind(post_form.text)
+        .execute(&state.pool)
+        .await else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert(HX_TRIGGER, "modifiedPosts".parse().unwrap());
     headers.into_response()
 }
 
-async fn get_todos(State(state): State<AppState>) -> impl IntoResponse {
+async fn get_todos(State(state): State<AppState>) -> Response {
     let state = state.read().await;
-    let todos = &state.todos;
+    let Ok(todos) = sqlx::query_as!(Todo, "SELECT id, text, done FROM todos ORDER BY time DESC")
+        .fetch_all(&state.pool)
+        .await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
 
     Html::<String>(
         html! {
             @for todo in todos {
-                @if !state.hide_completed || !todo.completed  {
+                @if !state.hide_completed || !todo.done {
                     (todo.partial())
                 }
             }
         }
         .into(),
     )
+    .into_response()
 }
 
 async fn toggle_completed(State(state): State<AppState>) -> impl IntoResponse {
